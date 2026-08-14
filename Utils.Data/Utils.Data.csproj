@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!--
+    Separate from Utils deliberately. Utils itself has zero package references and stays that way -
+    a consumer that only wants cursor pagination shouldn't drag EF Core in transitively. Anything
+    cross-cutting that genuinely needs EF Core belongs here instead. Same layering reasoning that
+    split Utils out of Permissions.Core in the first place, applied one level down.
+
+    EF Core only - no ASP.NET Core, no Permissions. An audit primitive has no business knowing about
+    HTTP or authorization; callers pass in the actor they already resolved.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Utils\Utils.csproj" />
+  </ItemGroup>
+
+</Project>

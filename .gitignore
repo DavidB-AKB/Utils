@@ -293,6 +293,11 @@ FakesAssemblies/
 .ntvs_analysis.dat
 node_modules/
 
+# admin-ui TypeScript build output - each consuming service's AdminUI imports directly from
+# admin-ui/dist/*.js, so this must be rebuilt (tsc -p admin-ui/tsconfig.json) after a fresh clone
+# rather than committed - see admin-ui/README.md.
+admin-ui/dist/
+
 # Visual Studio 6 build log
 *.plg
 
