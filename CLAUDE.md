@@ -44,6 +44,16 @@ No `dotnet run` — there's no host. No EF Core migrations either: `Utils.Data` 
 
   **This is a shared shape and a shared writer, not a centralized audit database.** Each service maps `AuditEvent` into its own schema and owns its own rows. There is deliberately no cross-service audit query — "who was granted admin" is a `Permissions` question and "who read my direct messages" is a `Comments` question, and nothing has needed to ask both at once. **Event-type constants stay per-service** (`Permissions.Models.AuditEventTypes`, `CommentsService.Models.AuditEventTypes`): the events a service records are exactly as service-specific as its domain, so there's no shared vocabulary here.
 
+## Messaging contract
+
+`Utils/Messaging/FactPublishing.cs` — `FactEnvelope` (`MessageId`, `EventType`, `OccurredAtUtc`, `Recipient`, `Data`) and `IFactPublisher`. The contract a producing service's outbox relay publishes through and a consuming service implements to receive.
+
+**Why it lives here rather than in either service.** Before it existed, `Users`' relay spoke its own `ITopicPublisher`/`OutboxMessage` and `Notifications`' inbound side spoke `IEventIngestionService`/`EventEnvelope`, so whatever hosted both had to hand-write a mapping between two near-identical shapes — and that mapping encoded the consumer's wire format in a third place nothing tested. With one shared contract, `Notifications` ships its own `IFactPublisher` (`AddNotificationsAsFactSubscriber`) and the host wires the two together with a single registration.
+
+This does not weaken the "no references between foundational services" rule — it's what upholds it. Both services depend on an abstraction neither owns, which is dependency inversion; a project reference from one to the other is what the convention actually forbids. Nor does it weaken the outbox pattern: the guarantees are that the fact commits atomically with the business write and is delivered at-least-once afterwards, and neither depends on the transport being networked.
+
+**`PublishAsync` returns nothing, deliberately.** The contract is "returns normally = handled, throws = retry." A consumer recognising a `MessageId` it has already processed must return normally, because a duplicate *is* the expected outcome of at-least-once delivery. Modelling that as a `false` return invites a publisher to treat it as failure and hand the message back to the queue, eventually dead-lettering something that was in fact delivered — so the shape makes that mistake unrepresentable rather than merely documenting against it.
+
 ## Leased queue
 
 `Utils/Queueing/` (the contract) and `Utils.Data/Queueing/` (the EF implementation). Take / complete / return over work stored as rows, with lease expiry and dead-lettering. Built for `Users`' `OutboxRelayService`, which previously selected unpublished rows with no lease at all — two relay hosts would both publish the same rows, making it unsafe to scale horizontally.
