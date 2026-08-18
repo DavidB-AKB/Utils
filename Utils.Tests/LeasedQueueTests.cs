@@ -17,7 +17,7 @@ public class LeasedQueueTests
         public DateTimeOffset? CompletedAtUtc { get; init; }
         public DateTimeOffset? DeadLetteredAtUtc { get; init; }
         public string? DeadLetterReason { get; init; }
-        public byte[]? RowVersion { get; init; }
+        public int Version { get; init; }
     }
 
     private sealed class TestQueueContext : DbContext

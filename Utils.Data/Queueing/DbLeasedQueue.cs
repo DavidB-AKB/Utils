@@ -71,9 +71,10 @@ public class DbLeasedQueue<TContext, TMessage> : ILeasedQueue<TMessage>
             // the next poll. Returning empty is honest — this consumer took nothing.
             //
             // This needs the message entity to carry a concurrency token (see ConfigureLeasable),
-            // and it needs the provider to enforce it. SQL Server does. EF Core's InMemory provider
-            // does not enforce rowversion across separate contexts, so the contended case can't be
-            // reproduced there — see the note in Utils.Tests/LeasedQueueTests.cs.
+            // and it needs the provider to enforce it. Any real relational provider does. EF Core's
+            // InMemory provider does not enforce concurrency tokens across separate contexts, so
+            // the contended case can't be reproduced there — see the note in
+            // Utils.Tests/LeasedQueueTests.cs.
             _dbContext.ChangeTracker.Clear();
             return [];
         }
@@ -140,7 +141,19 @@ public class DbLeasedQueue<TContext, TMessage> : ILeasedQueue<TMessage>
         entry.Property(nameof(ILeasable.LeaseToken)).CurrentValue = token;
         entry.Property(nameof(ILeasable.LeasedUntilUtc)).CurrentValue = leasedUntil;
         entry.Property(nameof(ILeasable.AttemptCount)).CurrentValue = attemptCount;
+
+        // The concurrency token is a plain int this library maintains, not a database-generated
+        // rowversion (see ConfigureLeasable for why). EF puts the ORIGINAL value in the UPDATE's
+        // WHERE clause, so bumping it here is what makes a second consumer's write of the same row
+        // match zero rows and raise DbUpdateConcurrencyException. Forgetting this line would not
+        // fail any single-threaded test - it would silently disable leasing under contention.
+        var version = entry.Property(VersionPropertyName);
+        version.CurrentValue = (int)(version.CurrentValue ?? 0) + 1;
     }
+
+    // Matches ConfigureLeasable's default. Both sides have to agree on the property name; it is a
+    // parameter there only so an entity can deviate, and nothing in this workspace does.
+    private const string VersionPropertyName = "Version";
 
     // Re-reads the row and confirms this caller still holds the lease it was given. A stale token
     // means the lease expired and someone else re-took it — completing or returning at that point

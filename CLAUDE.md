@@ -78,7 +78,7 @@ business write + outbox row      one transaction, database
 
 No SQS adapter exists yet, deliberately — nothing needs cross-process fan-out. The seam is `ILeasedQueue`; adding one later doesn't disturb the outbox half.
 
-**Known limit**: `TakeAsync` reads candidates and then stamps leases, relying on a concurrency token to reject a contended claim. On SQL Server a single `UPDATE ... WITH (READPAST, UPDLOCK) ... OUTPUT inserted.*` would claim and return in one round trip without the read-then-write window, but that's raw provider-specific SQL and this project stays provider-agnostic (it references only `Microsoft.EntityFrameworkCore`). The current form is correct — the loser's claim is rejected — just chattier under contention.
+**Known limit**: `TakeAsync` reads candidates and then stamps leases, relying on a concurrency token to reject a contended claim. A single provider-specific statement would claim and return in one round trip without the read-then-write window - `UPDATE ... RETURNING` on Postgres, `UPDATE ... WITH (READPAST, UPDLOCK) ... OUTPUT inserted.*` on SQL Server - but that's raw SQL and this project stays provider-agnostic (it references only `Microsoft.EntityFrameworkCore`). The current form is correct — the loser's claim is rejected — just chattier under contention.
 
 ## Append-only enforcement
 

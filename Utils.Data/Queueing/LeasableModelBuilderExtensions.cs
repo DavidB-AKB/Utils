@@ -8,18 +8,25 @@ public static class LeasableModelBuilderExtensions
     // Call from OnModelCreating for each ILeasable entity. Adds the indexes the take query needs
     // and the concurrency token the claim depends on.
     //
-    // rowVersionColumn is the property name of a byte[] concurrency token on the entity. It's
-    // required rather than optional: without it, two consumers reading the same candidate row would
-    // both successfully stamp their own lease, and both would process the message — which defeats
-    // the point of leasing. Making it a parameter rather than inferring it keeps this from silently
+    // versionColumn is the property name of an int concurrency token on the entity. It's required
+    // rather than optional: without it, two consumers reading the same candidate row would both
+    // successfully stamp their own lease, and both would process the message — which defeats the
+    // point of leasing. Making it a parameter rather than inferring it keeps this from silently
     // doing nothing when an entity forgets to declare one.
+    //
+    // A plain int the application increments (see DbLeasedQueue.SetLeaseValues), NOT SQL Server's
+    // IsRowVersion(). rowversion is a SQL Server type with no Postgres equivalent — Npgsql's
+    // closest analogue is mapping the system xmin column, which is provider-specific API. An
+    // app-incremented token behaves identically on both engines and keeps this project referencing
+    // nothing but Microsoft.EntityFrameworkCore, the same provider-agnostic bar the audit
+    // primitive's own "HasFilter is SQL Server-specific" note applies.
     public static ModelBuilder ConfigureLeasable<TMessage>(
-        this ModelBuilder modelBuilder, string rowVersionColumn = "RowVersion")
+        this ModelBuilder modelBuilder, string versionColumn = "Version")
         where TMessage : class, ILeasable
     {
         modelBuilder.Entity<TMessage>(entity =>
         {
-            entity.Property(rowVersionColumn).IsRowVersion();
+            entity.Property(versionColumn).IsConcurrencyToken();
 
             entity.Property(m => m.DeadLetterReason).HasMaxLength(1000);
 
