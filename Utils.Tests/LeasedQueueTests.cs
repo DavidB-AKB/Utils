@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Utils.Data.Queueing;
 using Utils.Queueing;
+using Utils.Tests.TestHelpers;
 
 namespace Utils.Tests;
 
@@ -22,14 +23,14 @@ public class LeasedQueueTests
 
     private sealed class TestQueueContext : DbContext
     {
-        private readonly string _databaseName;
+        private readonly string _connectionString;
 
-        public TestQueueContext(string databaseName) => _databaseName = databaseName;
+        public TestQueueContext(string connectionString) => _connectionString = connectionString;
 
         public DbSet<TestMessage> Messages => Set<TestMessage>();
 
         protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder) =>
-            optionsBuilder.UseInMemoryDatabase(_databaseName);
+            optionsBuilder.UseNpgsql(_connectionString);
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -38,10 +39,14 @@ public class LeasedQueueTests
         }
     }
 
+    // EnsureCreated rather than a migration: this library owns no DbContext, so the context above
+    // exists only here and has no migration chain of its own.
     private static async Task<(TestQueueContext Db, DbLeasedQueue<TestQueueContext, TestMessage> Queue)> CreateAsync(
         params string[] payloads)
     {
-        var db = new TestQueueContext(Guid.NewGuid().ToString());
+        var db = new TestQueueContext(TestPostgres.CreateDatabase());
+        await db.Database.EnsureCreatedAsync();
+
         var enqueued = DateTimeOffset.UtcNow.AddMinutes(-payloads.Length);
         for (var i = 0; i < payloads.Length; i++)
         {
@@ -176,11 +181,35 @@ public class LeasedQueueTests
         Assert.Empty(await queue.TakeAsync(10, TimeSpan.FromMinutes(1)));
     }
 
-    // No automated test for two consumers racing to claim the SAME candidate row. TakeAsync's
-    // DbUpdateConcurrencyException path depends on the provider enforcing the rowversion token
-    // across separate DbContext instances, which SQL Server (the real target) does and EF Core's
-    // InMemory provider — used throughout this class — does not. A test built on InMemory would let
-    // both claims through and so would demonstrate a testing-infrastructure gap rather than verify
-    // the guard. Same reasoning documented in Notifications' EventIngestionServiceTests and
-    // Permissions' RoleAssignmentServiceTests for their own unique-index races.
+    // Two consumers racing to claim the SAME candidate row - the guard the whole design rests on,
+    // and previously untestable: EF Core's InMemory provider does not enforce concurrency tokens
+    // across separate contexts, so both claims went through and a test built on it would have
+    // demonstrated a testing-infrastructure gap rather than verified anything.
+    //
+    // The race is forced rather than timed, so this can't flake. The loser reads the row BEFORE the
+    // winner claims it (that read is what captures the original version), and writes after - which
+    // is exactly the read-then-write window TakeAsync is chatty about in Utils/CLAUDE.md's "Known
+    // limit". EF returns the already-tracked instance for an entity it has seen, without refreshing
+    // it, so the loser's second read keeps that stale original version; a short lease on the
+    // winner's claim is only there to get the row back past the take query's availability filter.
+    [Fact]
+    public async Task TakeAsync_WhenAnotherConsumerClaimedTheSameRowFirst_TakesNothing()
+    {
+        var (winnerDb, winnerQueue) = await CreateAsync("contended");
+        await using var loserDb = new TestQueueContext(winnerDb.Database.GetConnectionString()!);
+        var loserQueue = new DbLeasedQueue<TestQueueContext, TestMessage>(loserDb);
+
+        await loserDb.Messages.ToListAsync();
+
+        var winner = await winnerQueue.TakeAsync(1, TimeSpan.FromMilliseconds(1));
+        Assert.Single(winner);
+        await Task.Delay(30);
+
+        Assert.Empty(await loserQueue.TakeAsync(1, TimeSpan.FromMinutes(1)));
+
+        // And the winner's lease is intact - a rejected claim must not half-apply and leave the row
+        // stamped with the loser's token.
+        var row = await winnerDb.Messages.AsNoTracking().SingleAsync();
+        Assert.Equal(winner[0].LeaseToken, row.LeaseToken);
+    }
 }

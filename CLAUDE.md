@@ -10,7 +10,7 @@ A shared library of small, generic, cross-cutting utilities for .NET 10 that hav
 
 - **`Utils/`** — the library itself (`Microsoft.NET.Sdk` class library, **zero package references** and no `FrameworkReference` to ASP.NET Core — nothing here should need either; if something needs ASP.NET Core types, that's a signal it belongs in `Permissions.Core` instead, which already has that dependency for its auth types).
 - **`Utils.Data/`** — cross-cutting code that genuinely needs EF Core, kept out of `Utils` so a consumer wanting only cursor pagination doesn't drag EF Core in transitively. Same layering reasoning that split this repo out of `Permissions.Core` in the first place, applied one level down. It still defines no `DbContext` — it contributes an entity plus a `ModelBuilder` configuration extension to *someone else's* context. Depends on `Utils` and `Microsoft.EntityFrameworkCore`, nothing more; deliberately not on ASP.NET Core or `Permissions.Core`, since an audit primitive has no business knowing about HTTP or authorization.
-- **`Utils.Tests/`** — xUnit.
+- **`Utils.Tests/`** — xUnit, running against a real Postgres via Testcontainers (`TestHelpers/TestPostgres.cs`) rather than EF Core's InMemory provider. This repo has no `DbContext` and no migrations, so the contexts under test are declared by the test classes themselves and built with `EnsureCreated` — there is no template database here, unlike the service repos' otherwise-identical helper. Needs a container runtime (Docker/OrbStack/Podman) running.
 
 ## What belongs here vs. `Permissions.Core`
 
@@ -78,13 +78,15 @@ business write + outbox row      one transaction, database
 
 No SQS adapter exists yet, deliberately — nothing needs cross-process fan-out. The seam is `ILeasedQueue`; adding one later doesn't disturb the outbox half.
 
+**The contended claim is verified, not assumed.** `TakeAsync_WhenAnotherConsumerClaimedTheSameRowFirst_TakesNothing` forces the race deterministically — the loser reads the row before the winner claims it and writes afterwards, which is exactly the read-then-write window below — and asserts it takes nothing and leaves the winner's lease intact. It was untestable until the suite moved to real Postgres: EF Core's InMemory provider does not enforce concurrency tokens across separate contexts, so both claims went through. Deleting the version bump in `SetLeaseValues` makes this test fail (confirmed by doing it), which is the point — that one line is the whole guard, and no single-threaded test notices its absence.
+
 **Known limit**: `TakeAsync` reads candidates and then stamps leases, relying on a concurrency token to reject a contended claim. A single provider-specific statement would claim and return in one round trip without the read-then-write window - `UPDATE ... RETURNING` on Postgres, `UPDATE ... WITH (READPAST, UPDLOCK) ... OUTPUT inserted.*` on SQL Server - but that's raw SQL and this project stays provider-agnostic (it references only `Microsoft.EntityFrameworkCore`). The current form is correct — the loser's claim is rejected — just chattier under contention.
 
 ## Append-only enforcement
 
 Audit rows must never be updated or deleted. That's enforced in **three layers, of increasing strength** — and it matters not to confuse them, because only the second is an actual security control.
 
-**1. `IAppendOnly` + `AppendOnlySaveChangesInterceptor` (in code).** Any entity marked `IAppendOnly` causes `SaveChanges`/`SaveChangesAsync` to throw if it's tracked as `Modified` or `Deleted`. Each consuming `DbContext` registers it in `OnConfiguring` — deliberately there rather than at `AddDbContext`, so it applies regardless of provider or how options were supplied, including when a test host swaps in the InMemory provider. Covered by `Utils.Tests/AppendOnlyTests.cs`, including that a rejected save doesn't partially apply.
+**1. `IAppendOnly` + `AppendOnlySaveChangesInterceptor` (in code).** Any entity marked `IAppendOnly` causes `SaveChanges`/`SaveChangesAsync` to throw if it's tracked as `Modified` or `Deleted`. Each consuming `DbContext` registers it in `OnConfiguring` — deliberately there rather than at `AddDbContext`, so it applies regardless of provider or how options were supplied, including when a test host swaps in a different connection string. Covered by `Utils.Tests/AppendOnlyTests.cs`, including that a rejected save doesn't partially apply.
 
 **This is a guardrail against an in-process mistake, not a security control.** It stops a developer accidentally mutating an audit row. It does nothing against raw SQL, a different context, a DBA, or an attacker who already has database credentials — the exact scenarios an audit trail exists to survive. Don't let its presence justify skipping layer 2.
 

@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Utils.Data;
 using Utils.Data.Auditing;
+using Utils.Tests.TestHelpers;
 
 namespace Utils.Tests;
 
@@ -11,15 +12,15 @@ public class AppendOnlyTests
 {
     private sealed class TestAuditContext : DbContext
     {
-        private readonly string _databaseName;
+        private readonly string _connectionString;
 
-        public TestAuditContext(string databaseName) => _databaseName = databaseName;
+        public TestAuditContext(string connectionString) => _connectionString = connectionString;
 
         public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
 
         protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
         {
-            optionsBuilder.UseInMemoryDatabase(_databaseName);
+            optionsBuilder.UseNpgsql(_connectionString);
             optionsBuilder.AddInterceptors(new AppendOnlySaveChangesInterceptor());
         }
 
@@ -27,7 +28,15 @@ public class AppendOnlyTests
             modelBuilder.ConfigureAuditEvents();
     }
 
-    private static TestAuditContext NewContext(string databaseName) => new(databaseName);
+    // EnsureCreated rather than a migration: this library owns no DbContext, so the context above
+    // exists only here and has no migration chain of its own. Idempotent, so the several contexts a
+    // single test opens over the same database all go through the same helper.
+    private static TestAuditContext NewContext(string connectionString)
+    {
+        var dbContext = new TestAuditContext(connectionString);
+        dbContext.Database.EnsureCreated();
+        return dbContext;
+    }
 
     private static AuditEvent NewEvent() => new()
     {
@@ -43,7 +52,7 @@ public class AppendOnlyTests
     [Fact]
     public async Task Insert_IsAllowed()
     {
-        await using var dbContext = NewContext(Guid.NewGuid().ToString());
+        await using var dbContext = NewContext(TestPostgres.CreateDatabase());
 
         dbContext.AuditEvents.Add(NewEvent());
         await dbContext.SaveChangesAsync();
@@ -54,12 +63,12 @@ public class AppendOnlyTests
     [Fact]
     public async Task Update_Throws()
     {
-        var databaseName = Guid.NewGuid().ToString();
-        await using var seed = NewContext(databaseName);
+        var connectionString = TestPostgres.CreateDatabase();
+        await using var seed = NewContext(connectionString);
         seed.AuditEvents.Add(NewEvent());
         await seed.SaveChangesAsync();
 
-        await using var dbContext = NewContext(databaseName);
+        await using var dbContext = NewContext(connectionString);
         var tracked = await dbContext.AuditEvents.SingleAsync();
         dbContext.Entry(tracked).CurrentValues.SetValues(tracked with { EventType = "tampered" });
 
@@ -70,12 +79,12 @@ public class AppendOnlyTests
     [Fact]
     public async Task Delete_Throws()
     {
-        var databaseName = Guid.NewGuid().ToString();
-        await using var seed = NewContext(databaseName);
+        var connectionString = TestPostgres.CreateDatabase();
+        await using var seed = NewContext(connectionString);
         seed.AuditEvents.Add(NewEvent());
         await seed.SaveChangesAsync();
 
-        await using var dbContext = NewContext(databaseName);
+        await using var dbContext = NewContext(connectionString);
         dbContext.AuditEvents.Remove(await dbContext.AuditEvents.SingleAsync());
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => dbContext.SaveChangesAsync());
@@ -87,12 +96,12 @@ public class AppendOnlyTests
     [Fact]
     public async Task Delete_ViaSynchronousSaveChanges_Throws()
     {
-        var databaseName = Guid.NewGuid().ToString();
-        await using var seed = NewContext(databaseName);
+        var connectionString = TestPostgres.CreateDatabase();
+        await using var seed = NewContext(connectionString);
         seed.AuditEvents.Add(NewEvent());
         await seed.SaveChangesAsync();
 
-        using var dbContext = NewContext(databaseName);
+        using var dbContext = NewContext(connectionString);
         dbContext.AuditEvents.Remove(dbContext.AuditEvents.Single());
 
         var exception = Assert.Throws<InvalidOperationException>(() => dbContext.SaveChanges());
@@ -104,18 +113,18 @@ public class AppendOnlyTests
     [Fact]
     public async Task RejectedSave_DoesNotPersistOtherChangesInTheSameUnitOfWork()
     {
-        var databaseName = Guid.NewGuid().ToString();
-        await using var seed = NewContext(databaseName);
+        var connectionString = TestPostgres.CreateDatabase();
+        await using var seed = NewContext(connectionString);
         seed.AuditEvents.Add(NewEvent());
         await seed.SaveChangesAsync();
 
-        await using var dbContext = NewContext(databaseName);
+        await using var dbContext = NewContext(connectionString);
         dbContext.AuditEvents.Add(NewEvent());
         dbContext.AuditEvents.Remove(await dbContext.AuditEvents.FirstAsync());
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => dbContext.SaveChangesAsync());
 
-        await using var verify = NewContext(databaseName);
+        await using var verify = NewContext(connectionString);
         Assert.Single(verify.AuditEvents);
     }
 }
