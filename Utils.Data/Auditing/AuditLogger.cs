@@ -10,7 +10,9 @@ namespace Utils.Data.Auditing;
 // OnModelCreating. Each service's rows live in its own schema; nothing here is centralized.
 //
 // Register as: services.AddScoped<IAuditLogger, AuditLogger<TheServicesDbContext>>();
-public class AuditLogger<TContext> : IAuditLogger
+// Registering IAuditEventWriter as well is what enables denial auditing - see that interface, and
+// note both registrations must resolve the SAME scoped instance so they share one DbContext.
+public class AuditLogger<TContext> : IAuditLogger, IAuditEventWriter
     where TContext : DbContext
 {
     private readonly TContext _dbContext;
@@ -60,6 +62,24 @@ public class AuditLogger<TContext> : IAuditLogger
             DetailsJson = details is null || details.Count == 0 ? null : JsonSerializer.Serialize(details),
             OccurredAtUtc = DateTimeOffset.UtcNow,
         });
+    }
+
+    // See IAuditEventWriter: for a denial there is no business write to commit alongside, so this
+    // one saves. AuditOutcome.Denied is the default here (and Succeeded is the default on Log)
+    // because that asymmetry matches why each exists - you reach for this one when something was
+    // refused.
+    public async Task WriteAsync(
+        string eventType,
+        string targetType,
+        string targetId,
+        string actorSubjectType,
+        string actorSubjectId,
+        IReadOnlyDictionary<string, string>? details = null,
+        AuditOutcome outcome = AuditOutcome.Denied,
+        CancellationToken cancellationToken = default)
+    {
+        Log(eventType, targetType, targetId, actorSubjectType, actorSubjectId, details, outcome);
+        await _dbContext.SaveChangesAsync(cancellationToken);
     }
 
     private static string? Truncate(string? value, int maxLength) =>
