@@ -83,6 +83,22 @@ No SQS adapter exists yet, deliberately — nothing needs cross-process fan-out.
 
 **Known limit**: `TakeAsync` reads candidates and then stamps leases, relying on a concurrency token to reject a contended claim. A single provider-specific statement would claim and return in one round trip without the read-then-write window - `UPDATE ... RETURNING` on Postgres, `UPDATE ... WITH (READPAST, UPDLOCK) ... OUTPUT inserted.*` on SQL Server - but that's raw SQL and this project stays provider-agnostic (it references only `Microsoft.EntityFrameworkCore`). The current form is correct — the loser's claim is rejected — just chattier under contention.
 
+## Workflows
+
+`Utils/Workflows` — an ordered state machine shared by anything that tracks work through stages.
+
+**Why a library and not a service.** Three planned consumers need one: work-item states (`Tasks`), sales-pipeline stages, and support-ticket statuses. Foundational services may not reference each other, but **a shared library both sides reference is dependency inversion rather than coupling** — the same escape `Utils.Messaging` uses to let `Users` and `Notifications` interoperate. Each consumer maps its **own** table and implements `IWorkflowState`; nothing here owns data, exactly as `Utils.Queueing.ILeasable` and the audit primitive work.
+
+**Why it exists before `Tasks` rather than after.** `Tasks` is where a workflow model would otherwise be born service-local, and the second consumer would then either duplicate it or force a migration. This was cheap to decide up front and expensive later.
+
+**`WorkflowStateCategory` (`Open`/`Active`/`Closed`) is the load-bearing part.** Every cross-workflow question — how much is still open, what isn't done, how long something sat in progress — has to work *without knowing the consumer's vocabulary*. Grouping by a free-text state key cannot answer any of them, and a reporting layer that tried would need a hardcoded list of every consumer's words. `Closed` deliberately does **not** distinguish success from failure: "done", "cancelled" and "lost" are all closed, and which it was is the state's own business. Splitting the category would drag every consumer's outcome vocabulary into this enum.
+
+**Transitions are unconstrained, deliberately.** There is no allowed-transition graph: any state may follow any other. Task trackers generally allow arbitrary moves, a deal can go back a stage, and a graph nobody asked for is speculative work that immediately becomes something to argue with. Adding constraints later is purely additive — a consumer needing them holds its own edge table. Category is the opposite case, which is why it is here from day one.
+
+**`TryCreate` returns a result rather than throwing**, because states usually arrive as consumer-supplied data over an API, where "you sent two initial states" is a `400` and not a crash. It rejects: no states, duplicate keys (case-insensitively — `"Done"` and `"done"` as two states is never intended), anything other than exactly one initial state (zero leaves a new item nowhere to start; several make the start depend on iteration order), and an all-`Closed` workflow.
+
+**An unknown state key is neither open nor closed.** A row pointing at a state that no longer exists is a data problem, and quietly reporting it as done would hide the work rather than surface the inconsistency.
+
 ## Append-only enforcement
 
 Audit rows must never be updated or deleted. That's enforced in **three layers, of increasing strength** — and it matters not to confuse them, because only the second is an actual security control.
