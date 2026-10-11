@@ -129,6 +129,43 @@ These are in genuine tension and the resolution should be deliberate: "never del
 
 `Notifications` has the one worked example of the distinction, and it is worth copying: its in-app inbox needs pruning and its delivery log must not be rewritten, so they are **separate tables**. Pruning the inbox loses nothing from the append-only record of what was delivered. Where a retention need and an append-only need meet on the same rows, splitting them is usually the answer rather than weakening either.
 
+## Secrets, without assuming a cloud
+
+`Utils.Configuration` — a third library project alongside `Utils` and `Utils.Data`, for the same reason that one exists: `Utils` has zero package references and stays that way, so anything cross-cutting needing a package gets its own project.
+
+**The provider-agnostic mechanism was already in the framework**, which is why this library is thin. Environment variables work everywhere, and `AddKeyPerFile` reads a directory of one-value-per-file secrets — exactly how Docker Compose/Swarm secrets, Kubernetes secret volumes and Nomad all deliver them. Both normalise `__` to `:`, so one name serves either:
+
+```
+Jwt__Secret                 as an environment variable
+/run/secrets/Jwt__Secret    as a file containing only the value
+```
+
+**Files take precedence over environment variables**, deliberately: an environment variable is readable from `/proc/<pid>/environ`, is inherited by every child process, and tends to appear in crash dumps and process listings. A file can be mounted read-only and owned by one user. Environment variables stay supported because some hosts offer nothing else.
+
+**What was actually missing was the reporting.** `AddPermissionsAuth` throws on `Jwt:Secret` from inside a registration call, so a customer discovered what to supply by starting a service, reading one exception, fixing it, and repeating. `RequireSecrets` reports **everything** missing at once, up front, naming each value's purpose and both ways to supply it. Every host calls it after `CreateBuilder` and before any `AddXServices`.
+
+**It runs outside `Development` only, and both halves of that matter.** In production every value must be supplied explicitly. In Development it is skipped, because `appsettings.Development.json` deliberately carries a placeholder `Jwt:Secret` that `RequireSecrets` rejects — and that rejection is the point, not a bug to work around.
+
+**The placeholder check is the one that earns its keep.** The shipped development secret is `development-change-this-to-a-strong-32-char-secret`: 48 characters, so a length check passes, and non-empty, so a presence check passes. A customer copying that file into production would get a service that starts cleanly and signs tokens with a secret anybody who has seen the repository knows. The check is substring-based (`change-this`, `changeme`, `development-`, `placeholder`, …) because the point is to catch a value nobody replaced; a real generated secret — random hex or base64 — contains none of them, which `ARealGeneratedSecretIsAccepted` pins.
+
+**A related fix went in with it.** `appsettings.json` — the file loaded in *production* — used to ship `ConnectionStrings:ServicesDb` as `Host=localhost;…;Password=postgres`. That is worse than nothing: it is present, so validation passes, and the service then fails with a *connection* error rather than a *configuration* one, pointing the reader at the database instead of at the config. The value now lives only in `appsettings.Development.json`, so production has nothing and says so.
+
+Checks short-circuit in order, so a value that is both too short and a placeholder is reported as too short. That is deliberate rather than a gap: either report leads the reader to replace the value.
+
+`Inspect` is the non-throwing form, for a preflight command or a health endpoint that wants to report rather than refuse to start.
+
+### Required secrets, as of today
+
+| Key | Needed for | Required |
+|---|---|---|
+| `ConnectionStrings:ServicesDb` | the shared database every service's schema lives in | yes |
+| `Jwt:Secret` | validating bearer tokens; the same value in every service and the issuer, ≥32 chars | yes |
+| `Smtp:Host`/`Username`/`Password` | sending real email; omit and `Notifications` logs instead | no |
+| `Leads:Categorizer:Claude:ApiKey` | LLM lead categorisation; omit and `Leads` falls back | no |
+| `ConnectionStrings:RelishYourChefDb` | only that product, which has its own database | its host only |
+
+The optional ones are deliberately **not** in `RequireSecrets`: each has a working fallback, and demanding them would stop a deployment that does not want the feature.
+
 ## How other services consume this
 
 Same cross-repo `ProjectReference` pattern every sibling-repo reference in this workspace uses (relative path, since these are sibling directories under `GitHub/`, not published NuGet packages yet):
