@@ -101,31 +101,33 @@ No SQS adapter exists yet, deliberately — nothing needs cross-process fan-out.
 
 ## Append-only enforcement
 
-Audit rows must never be updated or deleted. That's enforced in **three layers, of increasing strength** — and it matters not to confuse them, because only the second is an actual security control.
+Audit rows must never be updated or deleted. That's enforced in **layers of increasing strength** — and it matters not to confuse them, because the first is not a security control at all and the second does not, on Postgres, give the property it was originally claimed to.
 
 **1. `IAppendOnly` + `AppendOnlySaveChangesInterceptor` (in code).** Any entity marked `IAppendOnly` causes `SaveChanges`/`SaveChangesAsync` to throw if it's tracked as `Modified` or `Deleted`. Each consuming `DbContext` registers it in `OnConfiguring` — deliberately there rather than at `AddDbContext`, so it applies regardless of provider or how options were supplied, including when a test host swaps in a different connection string. Covered by `Utils.Tests/AppendOnlyTests.cs`, including that a rejected save doesn't partially apply.
 
-**This is a guardrail against an in-process mistake, not a security control.** It stops a developer accidentally mutating an audit row. It does nothing against raw SQL, a different context, a DBA, or an attacker who already has database credentials — the exact scenarios an audit trail exists to survive. Don't let its presence justify skipping layer 2.
+**This is a guardrail against an in-process mistake, not a security control.** It stops a developer accidentally mutating an audit row. It does nothing against raw SQL, a different context, a DBA, or an attacker who already has database credentials — the exact scenarios an audit trail exists to survive. Don't let its presence justify skipping layers 2 and 3.
 
-**2. Database grant (the real enforcement) — a deployment requirement, not code.** The application's runtime SQL login must hold `INSERT` and `SELECT` on the audit tables and **not** `UPDATE` or `DELETE`, with migrations run under a separate, more privileged login. Roughly:
+**2. Database grants (`deploy/sql/02-runtime-grants.sql`).** The runtime login holds `INSERT` and `SELECT` on the audit tables and not `UPDATE`/`DELETE`/`TRUNCATE`; migrations run as a separate, more privileged login that **owns** the tables. That ownership split is load-bearing rather than tidy: it is also what stops the runtime login disabling layer 3.
 
-```sql
--- Runtime login: can write and read audit history, cannot rewrite it.
-GRANT SELECT, INSERT ON [users].[AuditEvents]       TO [app_runtime];
-GRANT SELECT, INSERT ON [permissions].[AuditEvents] TO [app_runtime];
-GRANT SELECT, INSERT ON [comments].[AuditEvents]    TO [app_runtime];
-DENY  UPDATE, DELETE  ON [users].[AuditEvents]       TO [app_runtime];
-DENY  UPDATE, DELETE  ON [permissions].[AuditEvents] TO [app_runtime];
-DENY  UPDATE, DELETE  ON [comments].[AuditEvents]    TO [app_runtime];
-```
+**`TRUNCATE` is revoked explicitly**, because it is neither covered by withholding `DELETE` (it is a privilege of its own) nor caught by a row-level trigger (it fires none). Omitting it leaves a one-statement way to erase the whole trail.
 
-(RelishYourChef's audit table lives in its own `RelishYourChefDb`, so it needs the same treatment there.) `DENY` rather than merely withholding `GRANT`, since `DENY` survives the login later picking up a broader role. **This isn't wired up anywhere yet** — no deployment exists — but it's the layer that actually matters, and it's easy to forget precisely because it isn't code.
+**This layer is necessary but NOT sufficient, and the original design here was wrong about why.** It called for `DENY UPDATE, DELETE`, reasoning that `DENY` survives the login later picking up a broader role. That is true in SQL Server. **Postgres has no `DENY`** — its privilege system is purely additive, so `REVOKE` removes a prior grant and nothing expresses "never allow this even if granted later". Every service here is Postgres-only, so the SQL as previously documented could not have run at all (it also used SQL Server bracket identifiers, and its schema list predated `contacts` and `tasks`). The revokes are correct for the roles as configured and are silently undone by a later `GRANT`.
 
-**3. Ledger tables (compliance-grade, not currently used).** SQL Server 2022 and Azure SQL support `WITH (LEDGER = ON)` append-only tables: cryptographically verifiable, `UPDATE`/`DELETE` blocked by the engine itself, and tampering detectable after the fact. Worth reaching for only if tamper-*evidence* becomes a stated requirement rather than tamper-*resistance* — EF Core won't manage it (raw SQL in a migration), and it constrains later schema changes and restore semantics.
+**3. Append-only triggers (`deploy/sql/03-append-only-audit.sql`) — the layer that actually delivers the guarantee.** A `BEFORE UPDATE OR DELETE` row trigger plus a separate `BEFORE TRUNCATE` statement trigger on every `AuditEvents` table, raising `42501`. A trigger applies to **every** role, including the table owner and a superuser, so it closes exactly the hole layer 2 cannot. Run both; neither alone is the control.
+
+Both scripts **discover** what they act on rather than listing it: a schema belongs to a service exactly when it holds that service's own `__EFMigrationsHistory` table, which is this workspace's shared-database convention rather than a heuristic. Adding a service therefore needs no edit here — which is the direct fix for the stale hand-maintained list this replaced. Both are re-runnable and **must be re-run after every migration**; `03` fails loudly if it finds no audit tables, because a provisioning step that prints nothing looks exactly like one that worked.
+
+**Verified, not asserted.** `Utils.Tests/AppendOnlyGrantTests.cs` provisions a real database and a real unprivileged login and then tries to rewrite history as that login. Two of its tests are a permanent proof of the division of labour rather than a one-off mutation check: `ALaterGrantDefeatsTheRevokeButNotTheTrigger` grants the runtime role `UPDATE` and shows the trigger still refuses, and `WithoutTriggersTheGrantsStillStopTheOrdinaryCase` shows grants alone *do* allow that widened case. Remove either layer and one of the two fails.
+
+See `deploy/README.md` for how to run them, and `Utils` issue #4 for what is still missing before there is a deployment to run them in.
+
+**4. Tamper-evidence (not implemented, and a different requirement).** Everything above is tamper-*resistance*: a superuser can still drop a trigger and rewrite history, and nothing records that. Evidence needs a hash chain over the rows or an append-only WAL archive. SQL Server's `WITH (LEDGER = ON)` is the usual reference for this and is **not available on Postgres**, so the earlier note pointing at it was describing an option this workspace does not have. Worth reaching for only if tamper-evidence becomes a stated requirement.
 
 ## Retention vs. append-only
 
-These are in genuine tension and the resolution should be deliberate: "never delete" and "delete after N years" can't both be satisfied by the same mechanism. When a retention policy becomes real, it needs an explicit archival path (export, then a privileged purge under the migration login, itself audited) rather than someone quietly running a `DELETE` — which the grant above would block anyway. Nothing implements this yet; the tables grow unbounded today.
+These are in genuine tension and the resolution should be deliberate: "never delete" and "delete after N years" can't both be satisfied by the same mechanism. When a retention policy becomes real, it needs an explicit archival path (export, then a privileged purge, itself audited) rather than someone quietly running a `DELETE` — which the grants above would block, and the triggers would block **even for the migration login**, so a purge now requires explicitly disabling a trigger. That is the right shape: it makes the one legitimate deletion path a visible, deliberate act rather than an ordinary statement. Nothing implements this yet; the tables grow unbounded today.
+
+`Notifications` has the one worked example of the distinction, and it is worth copying: its in-app inbox needs pruning and its delivery log must not be rewritten, so they are **separate tables**. Pruning the inbox loses nothing from the append-only record of what was delivered. Where a retention need and an append-only need meet on the same rows, splitting them is usually the answer rather than weakening either.
 
 ## How other services consume this
 
