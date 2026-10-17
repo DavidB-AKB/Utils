@@ -16,6 +16,27 @@ systemd unit per host). Everything else below is real today.
 
 ---
 
+## 0. The short version
+
+`deploy/provision.sh` chains §1.2–§1.4 in the one order that works, and verifies the result:
+
+```bash
+export PGHOST=... PGUSER=postgres PGPASSWORD=...
+RUNTIME_PASSWORD="$(openssl rand -base64 32)" MIGRATOR_PASSWORD="$(openssl rand -base64 32)" \
+  ./deploy/provision.sh --database ServicesDb --create-roles --migrate
+```
+
+Re-runnable, and **re-run it after every upgrade** — with or without `--migrate`, since an upgrade
+applied by any other route still leaves new tables ungranted and new audit tables unprotected.
+
+It exits non-zero if any role other than the migrator can rewrite audit history. That check
+deliberately looks at *every* role rather than the runtime one: step §1.4 has just revoked the
+runtime role's privileges, so checking it would only re-verify what the previous statement did. What
+provisioning cannot fix by itself is some *other* role — a human DBA login, a reused application
+role — holding `UPDATE`/`DELETE`/`TRUNCATE`, and nothing else looks for that.
+
+The sections below are what the script does, for when something goes wrong in the middle of it.
+
 ## 1. Provision from scratch
 
 ### 1.1 Postgres

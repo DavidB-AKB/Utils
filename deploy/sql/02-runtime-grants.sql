@@ -21,8 +21,10 @@
 -- psql substitutes :'var' while lexing the input, and a dollar-quoted body ($$ ... $$) is ONE token
 -- to the lexer - so a :'runtime_role' written inside the block below would be sent to the server
 -- verbatim and fail there. These two SELECTs are plain statements, where substitution does happen.
+\o /dev/null
 SELECT set_config('utils.runtime_role',  :'runtime_role',  false);
 SELECT set_config('utils.migrator_role', :'migrator_role', false);
+\o
 
 DO $$
 DECLARE

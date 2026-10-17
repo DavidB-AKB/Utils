@@ -82,8 +82,12 @@ public class AppendOnlyGrantTests
         NpgsqlConnection connection, string fileName, string runtimeRole, string migratorRole)
     {
         var sql = await File.ReadAllTextAsync(ScriptPath(fileName));
+        // psql meta-commands are stripped: they are interpreted by psql itself and are not SQL, so
+        // Npgsql would reject them. Everything that matters to the test is the SQL between them.
+        sql = string.Join(
+            "\n",
+            sql.Split('\n').Where(line => !line.TrimStart().StartsWith("\\", StringComparison.Ordinal)));
         sql = sql
-            .Replace("\\set ON_ERROR_STOP on", string.Empty)
             .Replace(":'runtime_role'", $"'{runtimeRole}'")
             .Replace(":'migrator_role'", $"'{migratorRole}'");
         await ExecuteAsync(connection, sql);
