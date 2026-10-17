@@ -166,6 +166,45 @@ Checks short-circuit in order, so a value that is both too short and a placehold
 
 The optional ones are deliberately **not** in `RequireSecrets`: each has a working fallback, and demanding them would stop a deployment that does not want the feature.
 
+## Migration safety
+
+Once a customer is running real data, every migration is an upgrade against a database nobody here can inspect. The failure mode is silent and permanent: a dropped column takes its contents with it, and the first anyone knows is a customer asking where something went.
+
+So the policy is **additive-only by default**, and it is a **check rather than a paragraph** — `Utils.Migrations.MigrationSafety`, with one test in every service's suite scanning its own `Migrations/` directory.
+
+**Only `Up()` is analysed.** `Down()` is destructive by definition — undoing a migration is what it is for — and that distinction is the whole reason this is worth writing rather than grepping: a naive grep reports ~70 destructive operations across these repos, of which exactly **one** was in an `Up()`.
+
+| Operation | Classified as |
+|---|---|
+| `DropColumn`, `DropTable`, `DropSchema` | `DestroysData` |
+| `AlterColumn`, destructive raw `Sql` | `MayDestroyData` |
+| `RenameColumn`, `RenameTable` | `BreaksRunningCode` — the old version still serving traffic breaks until redeployed |
+| `DropIndex`, `DropForeignKey`, `DropPrimaryKey` | `RelaxesAConstraint` — no loss, but a window where the guarantee can be violated |
+
+**Raw SQL is read, not refused.** It is the one operation whose effect cannot be inferred from its name, so the statement is scanned for `DROP`/`ALTER`/`DELETE`/`TRUNCATE`/`UPDATE`. Refusing *all* raw SQL would be noise — this workspace uses it legitimately for functional indexes EF cannot express — and noise trains people to acknowledge without reading.
+
+To accept an operation that genuinely has to happen, say so in the migration, within 8 lines above the call:
+
+```csharp
+// MIGRATION-SAFETY-REVIEWED: <what happens to existing rows, and how it was tested>
+```
+
+The marker is scoped to nearby lines rather than the whole file, because the way this would rot is a second author opening a file that already has one in it.
+
+**One gotcha, and it is the one that would have made the whole check decorative**: EF scaffolds `migrationBuilder.AlterColumn<string>(…)`, so a pattern demanding `(` straight after the operation name matches *none* of the real ones. Caught by a test, not by review.
+
+### What this does not promise
+
+**There is no tested rollback, and the policy is forward-fix only.** `Down()` methods exist because EF generates them, but nothing in this workspace ever executes one — no suite applies a migration and then reverts it. Treat them as documentation of intent, not as a path anybody has walked. A release that goes wrong is fixed by another migration going forward, which is also the only option once a destructive change has run.
+
+The live example of why the check matters is in `Comments`: a `Path` column was once seeded one character over its own limit, and that was caught only because migrations started actually being applied in tests rather than the schema being built from the model.
+
+### Interaction with the append-only audit tables
+
+The triggers from `deploy/sql/03-append-only-audit.sql` block `UPDATE`/`DELETE`/`TRUNCATE` on `AuditEvents` **for every role, including the migrator**. DDL is unaffected, so adding a column to an audit table is ordinary; **backfilling one is not** — a data migration over audit rows has to disable the trigger explicitly, run, and re-enable it.
+
+That friction is deliberate rather than an oversight: rewriting audit history should be a visible, deliberate act that appears in a migration someone reviewed, not an `UPDATE` that works because nothing stopped it.
+
 ## How other services consume this
 
 Same cross-repo `ProjectReference` pattern every sibling-repo reference in this workspace uses (relative path, since these are sibling directories under `GitHub/`, not published NuGet packages yet):
